@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+pytesseract
+pdf2image
+python-pptx
+google-generativeai
+requests
+pydantic
