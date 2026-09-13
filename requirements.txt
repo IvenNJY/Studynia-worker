@@ -4,6 +4,6 @@ python-multipart
 pytesseract
 pdf2image
 python-pptx
-google-generativeai
+google-genai
 requests
 pydantic
