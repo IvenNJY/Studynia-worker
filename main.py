@@ -102,7 +102,7 @@ async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest):
             "D": "Option D"
           }},
           "correct_answer": "A",
-          "explanation": "Brief explanation referencing the source material.",
+          "explanation": "Brief explanation referencing the source material. Include which slide or page and source reference it was from",
           "source_id": 1
         }}
       ]
