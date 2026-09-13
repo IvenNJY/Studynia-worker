@@ -115,7 +115,7 @@ async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest):
     try:
         # 3. Use the updated client.models.generate_content pattern with configuration types
         ai_response = client.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-3.1-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=(
