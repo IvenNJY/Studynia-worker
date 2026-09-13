@@ -9,27 +9,15 @@ from pydantic import BaseModel
 import pytesseract
 from pdf2image import convert_from_bytes
 from pptx import Presentation
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
-# 1. Configure Gemini AI using standard environment variables
+# 1. Configure the modern Google GenAI Client
 api_key = os.environ.get('GEMINI_API_KEY')
 if not api_key:
     raise ValueError("❌ Error: GEMINI_API_KEY environment variable not set.")
     
-genai.configure(api_key=api_key)
-
-model = genai.GenerativeModel(
-    model_name='gemini-2.5-flash',
-    system_instruction=(
-        "You are an academic quiz generator. You must base all questions and answers "
-        "strictly on the provided source materials without inventing outside facts."
-    ),
-    generation_config={
-        "temperature": 0.2,
-        "top_p": 0.95,
-        "response_mime_type": "application/json"
-    }
-)
+client = genai.Client(api_key=api_key)
 
 # 2. Configure FastAPI Application
 app = FastAPI(title="LMS Quiz Generator API")
@@ -37,7 +25,6 @@ app = FastAPI(title="LMS Quiz Generator API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000",],
-    # allow * for all
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -126,7 +113,21 @@ async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest):
     """
 
     try:
-        ai_response = model.generate_content(prompt)
+        # 3. Use the updated client.models.generate_content pattern with configuration types
+        ai_response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are an academic quiz generator. You must base all questions and answers "
+                    "strictly on the provided source materials without inventing outside facts."
+                ),
+                temperature=0.2,
+                top_p=0.95,
+                response_mime_type="application/json"
+            )
+        )
+        
         quiz_data = json.loads(ai_response.text)
         return {
             "source_list": source_list,
