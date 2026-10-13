@@ -88,10 +88,142 @@ class CanvasQuizRequest(BaseModel):
     owner_id: str
     assessment_id: str
     job_id: str
-    callback_url: str
-    callback_token: str
+    callback_url: Optional[str] = None
+    callback_token: Optional[str] = None
     canvas_token: Optional[str] = None
     num_questions: int = 5
+
+
+def supabase_request(method: str, table: str, *, params=None, payload=None):
+    supabase_url = (os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured on the worker")
+
+    response = requests.request(
+        method,
+        f"{supabase_url}/rest/v1/{table}",
+        params=params,
+        json=payload,
+        headers={
+            "apikey": service_key,
+            "Authorization": f"Bearer {service_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        timeout=(10, 45),
+    )
+    response.raise_for_status()
+    return response
+
+
+def create_assessment_notification(request: CanvasQuizRequest, status: str, error: Optional[str] = None):
+    existing = supabase_request(
+        "GET",
+        "inbox_notifications",
+        params={
+            "select": "id",
+            "recipient_id": f"eq.{request.owner_id}",
+            "assessment_id": f"eq.{request.assessment_id}",
+            "notification_type": "eq.assessment_share",
+            "limit": "1",
+        },
+    ).json()
+    if existing:
+        return
+
+    ready = status == "completed"
+    title = "Your assessment is ready" if ready else "Assessment generation failed"
+    body = (
+        f"Your assessment is ready in Past Assessments. Open Practice to start it."
+        if ready
+        else f"Your assessment could not be generated. {error or 'Please try again from Practice.'}"
+    )
+    supabase_request(
+        "POST",
+        "inbox_notifications",
+        payload={
+            "recipient_id": request.owner_id,
+            "actor_id": request.owner_id,
+            "notification_type": "assessment_share",
+            "assessment_id": request.assessment_id,
+            "title": title,
+            "body": body,
+        },
+    )
+
+
+def persist_assessment_job(request: CanvasQuizRequest, job: dict):
+    if job["status"] == "completed":
+        quiz = job.get("result", {}).get("quiz", [])
+        if not quiz:
+            raise ValueError("Generated assessment contains no questions")
+
+        existing_questions = supabase_request(
+            "GET",
+            "assessment_questions",
+            params={"select": "id", "assessment_id": f"eq.{request.assessment_id}", "limit": "1"},
+        ).json()
+        if not existing_questions:
+            supabase_request(
+                "POST",
+                "assessment_questions",
+                payload=[
+                    {
+                        "assessment_id": request.assessment_id,
+                        "source_id": question.get("source_id"),
+                        "question_text": question["question"],
+                        "question_type": "mcq",
+                        "options": question["options"],
+                        "correct_answer": question["correct_answer"],
+                        "explanation": question.get("explanation"),
+                    }
+                    for question in quiz
+                ],
+            )
+
+        source = {
+            "status": "ready",
+            "job_id": request.job_id,
+            "source_list": job.get("result", {}).get("source_list", []),
+        }
+    else:
+        source = {
+            "status": "failed",
+            "job_id": request.job_id,
+            "error": (job.get("error") or "Assessment generation failed")[:1000],
+        }
+
+    supabase_request(
+        "PATCH",
+        "assessments",
+        params={"id": f"eq.{request.assessment_id}", "user_id": f"eq.{request.owner_id}"},
+        payload={"source": json.dumps(source)},
+    )
+    create_assessment_notification(request, job["status"], job.get("error"))
+
+
+def finalize_generation_job(job_id: str, request: CanvasQuizRequest, job: dict):
+    job["persistence_status"] = "saving"
+    generation_jobs[job_id] = job
+    for attempt in range(3):
+        try:
+            persist_assessment_job(request, job)
+            job["persistence_status"] = "saved"
+            break
+        except Exception as error:
+            print(f"Assessment database save attempt {attempt + 1} failed: {error}")
+            job["persistence_error"] = str(error)
+            if attempt < 2:
+                import time
+                time.sleep(2 ** attempt)
+    else:
+        job["persistence_status"] = "failed"
+
+    generation_jobs[job_id] = job
+    # Support in-flight jobs created by the older callback-based app version.
+    if request.callback_url and request.callback_token:
+        send_generation_callback(job_id, request, job)
 
 
 def send_generation_callback(job_id: str, request: CanvasQuizRequest, job: dict):
@@ -151,13 +283,13 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
         except Exception as e:
             job = {"owner_id": owner_id, "status": "failed", "error": f"Failed processing {file_item.filename}: {str(e)}"}
             generation_jobs[job_id] = job
-            send_generation_callback(job_id, request, job)
+            finalize_generation_job(job_id, request, job)
             return
 
     if not combined_text.strip():
         job = {"owner_id": owner_id, "status": "failed", "error": "No readable text extracted from files."}
         generation_jobs[job_id] = job
-        send_generation_callback(job_id, request, job)
+        finalize_generation_job(job_id, request, job)
         return
 
     prompt = f"""
@@ -208,15 +340,17 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
     except Exception as e:
         job = {"owner_id": owner_id, "status": "failed", "error": f"AI generation failed: {str(e)}"}
         generation_jobs[job_id] = job
-    send_generation_callback(job_id, request, job)
+    finalize_generation_job(job_id, request, job)
 
 
 @app.post("/generate-quiz-from-urls")
 async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest, background_tasks: BackgroundTasks):
     if not request.files:
         raise HTTPException(status_code=400, detail="At least one material link is required")
-    if not request.owner_id or not request.assessment_id or not request.callback_token:
+    if not request.owner_id or not request.assessment_id:
         raise HTTPException(status_code=400, detail="Generation job metadata is required")
+    if not (os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")) or not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
+        raise HTTPException(status_code=503, detail="Worker database persistence is not configured")
     job_id = request.job_id or str(uuid.uuid4())
     generation_jobs[job_id] = {"owner_id": request.owner_id, "status": "queued"}
     background_tasks.add_task(generate_quiz_job, job_id, request.owner_id, request)
