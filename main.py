@@ -86,8 +86,38 @@ class FileItem(BaseModel):
 class CanvasQuizRequest(BaseModel):
     files: List[FileItem]
     owner_id: str
+    assessment_id: str
+    job_id: str
+    callback_url: str
+    callback_token: str
     canvas_token: Optional[str] = None
     num_questions: int = 5
+
+
+def send_generation_callback(job_id: str, request: CanvasQuizRequest, job: dict):
+    callback_payload = {
+        "job_id": job_id,
+        "owner_id": request.owner_id,
+        "assessment_id": request.assessment_id,
+        "status": job["status"],
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                request.callback_url,
+                json=callback_payload,
+                headers={"X-Assessment-Callback-Token": request.callback_token},
+                timeout=30,
+            )
+            response.raise_for_status()
+            return
+        except Exception as error:
+            print(f"Assessment callback attempt {attempt + 1} failed: {error}")
+            if attempt < 2:
+                import time
+                time.sleep(2 ** attempt)
 
 def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
     generation_jobs[job_id] = {"owner_id": owner_id, "status": "processing"}
@@ -119,11 +149,15 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
             combined_text += f"\n[BEGIN SOURCE {source_id}: {file_item.filename}]\n{extracted}\n[END SOURCE {source_id}]\n"
 
         except Exception as e:
-            generation_jobs[job_id] = {"owner_id": owner_id, "status": "failed", "error": f"Failed processing {file_item.filename}: {str(e)}"}
+            job = {"owner_id": owner_id, "status": "failed", "error": f"Failed processing {file_item.filename}: {str(e)}"}
+            generation_jobs[job_id] = job
+            send_generation_callback(job_id, request, job)
             return
 
     if not combined_text.strip():
-        generation_jobs[job_id] = {"owner_id": owner_id, "status": "failed", "error": "No readable text extracted from files."}
+        job = {"owner_id": owner_id, "status": "failed", "error": "No readable text extracted from files."}
+        generation_jobs[job_id] = job
+        send_generation_callback(job_id, request, job)
         return
 
     prompt = f"""
@@ -166,21 +200,24 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
         quiz = quiz_data.get("quiz", [])
         if not isinstance(quiz, list) or not quiz:
             raise ValueError("The AI returned no quiz questions")
-        generation_jobs[job_id] = {"owner_id": owner_id, "status": "completed", "result": {
+        job = {"owner_id": owner_id, "status": "completed", "result": {
             "source_list": source_list,
             "quiz": quiz
         }}
+        generation_jobs[job_id] = job
     except Exception as e:
-        generation_jobs[job_id] = {"owner_id": owner_id, "status": "failed", "error": f"AI generation failed: {str(e)}"}
+        job = {"owner_id": owner_id, "status": "failed", "error": f"AI generation failed: {str(e)}"}
+        generation_jobs[job_id] = job
+    send_generation_callback(job_id, request, job)
 
 
 @app.post("/generate-quiz-from-urls")
 async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest, background_tasks: BackgroundTasks):
     if not request.files:
         raise HTTPException(status_code=400, detail="At least one material link is required")
-    if not request.owner_id:
-        raise HTTPException(status_code=400, detail="An owner id is required")
-    job_id = str(uuid.uuid4())
+    if not request.owner_id or not request.assessment_id or not request.callback_token:
+        raise HTTPException(status_code=400, detail="Generation job metadata is required")
+    job_id = request.job_id or str(uuid.uuid4())
     generation_jobs[job_id] = {"owner_id": request.owner_id, "status": "queued"}
     background_tasks.add_task(generate_quiz_job, job_id, request.owner_id, request)
     return {"job_id": job_id, "status": "queued"}
