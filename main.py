@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import pytesseract
 from pdf2image import convert_from_bytes
 from pptx import Presentation
-import google.generativeai as genai
+from google import genai
 
 # 1. Configure Gemini AI using standard environment variables
 api_key = os.environ.get('GEMINI_API_KEY')
