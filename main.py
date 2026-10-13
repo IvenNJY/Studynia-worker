@@ -12,25 +12,18 @@ import pytesseract
 from pdf2image import convert_from_bytes
 from pptx import Presentation
 from google import genai
+from google.genai import types
 
 # 1. Configure Gemini AI using standard environment variables
 api_key = os.environ.get('GEMINI_API_KEY')
 if not api_key:
     raise ValueError("❌ Error: GEMINI_API_KEY environment variable not set.")
     
-genai.configure(api_key=api_key)
-
-model = genai.GenerativeModel(
-    model_name='gemini-2.5-flash',
-    system_instruction=(
-        "You are an academic quiz generator. You must base all questions and answers "
-        "strictly on the provided source materials without inventing outside facts."
-    ),
-    generation_config={
-        "temperature": 0.2,
-        "top_p": 0.95,
-        "response_mime_type": "application/json"
-    }
+client = genai.Client(api_key=api_key)
+MODEL_NAME = "gemini-2.5-flash"
+SYSTEM_INSTRUCTION = (
+    "You are an academic quiz generator. You must base all questions and answers "
+    "strictly on the provided source materials without inventing outside facts."
 )
 
 # 2. Configure FastAPI Application
@@ -159,7 +152,16 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
     """
 
     try:
-        ai_response = model.generate_content(prompt)
+        ai_response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                top_p=0.95,
+                response_mime_type="application/json",
+                system_instruction=SYSTEM_INSTRUCTION,
+            ),
+        )
         quiz_data = json.loads(ai_response.text)
         quiz = quiz_data.get("quiz", [])
         if not isinstance(quiz, list) or not quiz:
