@@ -8,9 +8,11 @@ from typing import List, Optional
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from PIL import Image
 import pytesseract
 from pdf2image import convert_from_bytes
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from google import genai
 from google.genai import types
 
@@ -66,7 +68,23 @@ def extract_text_in_memory(file_bytes: bytes, filename: str, content_type: str =
     elif extension == "pptx" or "presentationml" in content_type:
         prs = Presentation(io.BytesIO(file_bytes))
         for i, slide in enumerate(prs.slides):
-            slide_text = "\n".join([shape.text for shape in slide.shapes if hasattr(shape, "text")])
+            slide_parts = [shape.text.strip() for shape in slide.shapes
+                           if hasattr(shape, "text") and shape.text.strip()]
+
+            def add_image_ocr(shapes, image_number):
+                for shape in shapes:
+                    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                        image_number = add_image_ocr(shape.shapes, image_number)
+                    elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        image_number += 1
+                        image = Image.open(io.BytesIO(shape.image.blob)).convert("RGB")
+                        image_text = pytesseract.image_to_string(image).strip()
+                        if image_text:
+                            slide_parts.append(f"[Text detected in image {image_number}]\n{image_text}")
+                return image_number
+
+            add_image_ocr(slide.shapes, 0)
+            slide_text = "\n".join(slide_parts)
             text += f"--- Slide {i+1} ---\n{slide_text}\n"
     elif extension in {"txt", "md", "csv", "html", "htm"} or content_type.startswith("text/"):
         decoded = file_bytes.decode("utf-8-sig", errors="replace")
