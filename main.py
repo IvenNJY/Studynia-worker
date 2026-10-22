@@ -350,6 +350,7 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
         quiz = quiz_data.get("quiz", [])
         if not isinstance(quiz, list) or not quiz:
             raise ValueError("The AI returned no quiz questions")
+        quiz = quiz[:request.num_questions]
         job = {"owner_id": owner_id, "status": "completed", "result": {
             "source_list": source_list,
             "quiz": quiz
@@ -363,6 +364,8 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
 
 @app.post("/generate-quiz-from-urls")
 async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest, background_tasks: BackgroundTasks):
+    # Enforce the limit at the worker boundary as clients can bypass the web app API.
+    request.num_questions = min(15, max(1, request.num_questions))
     if not request.files:
         raise HTTPException(status_code=400, detail="At least one material link is required")
     if not request.owner_id or not request.assessment_id:
