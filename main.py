@@ -1,30 +1,57 @@
-import os
 import io
 import json
-import requests
+import logging
+import os
+import time
 import uuid
 import zipfile
 from html.parser import HTMLParser
 from typing import List, Optional
+
+import fitz
+import pytesseract
+import requests
+from docx import Document
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from PIL import Image
-import pytesseract
-import fitz
-from docx import Document
+from pydantic import BaseModel
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from google import genai
 from google.genai import types
 
-# 1. Configure Gemini AI using standard environment variables
-api_key = os.environ.get('GEMINI_API_KEY')
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("studynia.worker")
+
+
+def log_timing(event: str, started_at: float, **fields):
+    """Write a structured duration record to stdout for Render logs."""
+    record = {
+        "event": event,
+        "duration_seconds": round(time.perf_counter() - started_at, 3),
+        **fields,
+    }
+    logger.info("timing %s", json.dumps(record, ensure_ascii=False, default=str))
+
+
+def log_event(event: str, **fields):
+    """Write a structured event record without exposing request credentials."""
+    record = {"event": event, **fields}
+    logger.info("event %s", json.dumps(record, ensure_ascii=False, default=str))
+
+
+# Configure Gemini AI using standard environment variables.
+api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("❌ Error: GEMINI_API_KEY environment variable not set.")
-    
+
 client = genai.Client(api_key=api_key)
 MODEL_NAME = "gemini-2.5-flash"
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"}
 SYSTEM_INSTRUCTION = (
     "You are an academic quiz generator. You must base all questions and answers "
     "strictly on the provided source materials without inventing outside facts."
@@ -37,6 +64,7 @@ app = FastAPI(title="LMS Quiz Generator API")
 # generation itself runs after the request returns, so switching tabs does not
 # cancel it.
 generation_jobs: dict[str, dict] = {}
+generation_started_at: dict[str, float] = {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,12 +86,36 @@ class TextOnlyHTMLParser(HTMLParser):
 
 def ocr_image_bytes(image_bytes: bytes) -> str:
     """Extract readable text from one raster image."""
-    with Image.open(io.BytesIO(image_bytes)) as source_image:
-        image = source_image.convert("RGB")
+    started_at = time.perf_counter()
+    image_width = None
+    image_height = None
     try:
-        return pytesseract.image_to_string(image).strip()
-    finally:
-        image.close()
+        with Image.open(io.BytesIO(image_bytes)) as source_image:
+            image_width, image_height = source_image.size
+            image = source_image.convert("RGB")
+        try:
+            extracted_text = pytesseract.image_to_string(image).strip()
+        finally:
+            image.close()
+    except Exception:
+        log_timing(
+            "image_ocr_failed",
+            started_at,
+            image_bytes=len(image_bytes),
+            image_width=image_width,
+            image_height=image_height,
+        )
+        raise
+
+    log_timing(
+        "image_ocr_completed",
+        started_at,
+        image_bytes=len(image_bytes),
+        image_width=image_width,
+        image_height=image_height,
+        extracted_characters=len(extracted_text),
+    )
+    return extracted_text
 
 
 def extract_pdf(file_bytes: bytes) -> str:
@@ -86,7 +138,12 @@ def extract_pdf(file_bytes: bytes) -> str:
                     image_text_found = True
                     page_parts.append(f"[Text detected in image {image_index}]\n{image_text}")
             except Exception as image_error:
-                print(f"Could not read PDF image {image_index} on page {page_number}: {image_error}")
+                logger.warning(
+                    "Could not read PDF image %s on page %s: %s",
+                    image_index,
+                    page_number,
+                    image_error,
+                )
 
         # Scanned pages sometimes expose no separate images in the PDF structure.
         # OCR the rendered page only when it has no extractable text or image text.
@@ -97,7 +154,7 @@ def extract_pdf(file_bytes: bytes) -> str:
                 if page_ocr:
                     page_parts.append(f"[Text detected by page OCR]\n{page_ocr}")
             except Exception as render_error:
-                print(f"Could not OCR PDF page {page_number}: {render_error}")
+                logger.warning("Could not OCR PDF page %s: %s", page_number, render_error)
 
         if page_parts:
             extracted_pages.append(f"--- Page {page_number} ---\n" + "\n".join(page_parts))
@@ -128,7 +185,12 @@ def extract_pptx(file_bytes: bytes) -> str:
                             slide_parts.append(f"[Text detected in image {image_number}]\n{image_text}")
                     except Exception as image_error:
                         # Linked pictures may not have image bytes embedded in the PPTX.
-                        print(f"Could not read image {image_number} on slide {slide_number}: {image_error}")
+                        logger.warning(
+                            "Could not read image %s on slide %s: %s",
+                            image_number,
+                            slide_number,
+                            image_error,
+                        )
                     continue
 
                 if hasattr(shape, "text"):
@@ -173,7 +235,7 @@ def extract_docx(file_bytes: bytes) -> str:
                     if image_text:
                         parts.append(f"[Text detected in image {image_number}]\n{image_text}")
                 except Exception as image_error:
-                    print(f"Could not read DOCX image {image_name}: {image_error}")
+                    logger.warning("Could not read DOCX image %s: %s", image_name, image_error)
     except zipfile.BadZipFile as package_error:
         raise ValueError("The DOCX package is invalid") from package_error
 
@@ -195,7 +257,7 @@ def extract_text_in_memory(file_bytes: bytes, filename: str, content_type: str =
     if extension == "docx" or "wordprocessingml" in content_type:
         return extract_docx(file_bytes)
 
-    if extension in {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"} or content_type.startswith("image/"):
+    if extension in IMAGE_EXTENSIONS or content_type.startswith("image/"):
         return ocr_image_bytes(file_bytes)
 
     if extension in {"txt", "md", "csv", "html", "htm"} or content_type.startswith("text/"):
@@ -228,7 +290,11 @@ class CanvasQuizRequest(BaseModel):
 
 
 def supabase_request(method: str, table: str, *, params=None, payload=None):
-    supabase_url = (os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")
+    supabase_url = (
+        os.environ.get("SUPABASE_URL")
+        or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+        or ""
+    ).rstrip("/")
     service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not supabase_url or not service_key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured on the worker")
@@ -337,26 +403,57 @@ def persist_assessment_job(request: CanvasQuizRequest, job: dict):
 
 
 def finalize_generation_job(job_id: str, request: CanvasQuizRequest, job: dict):
+    persistence_started_at = time.perf_counter()
     job["persistence_status"] = "saving"
     generation_jobs[job_id] = job
     for attempt in range(3):
+        attempt_started_at = time.perf_counter()
         try:
             persist_assessment_job(request, job)
             job["persistence_status"] = "saved"
+            log_timing(
+                "database_save_attempt_completed",
+                attempt_started_at,
+                job_id=job_id,
+                attempt=attempt + 1,
+                status="saved",
+            )
             break
         except Exception as error:
-            print(f"Assessment database save attempt {attempt + 1} failed: {error}")
+            log_timing(
+                "database_save_attempt_failed",
+                attempt_started_at,
+                job_id=job_id,
+                attempt=attempt + 1,
+                error_type=type(error).__name__,
+            )
             job["persistence_error"] = str(error)
             if attempt < 2:
-                import time
                 time.sleep(2 ** attempt)
     else:
         job["persistence_status"] = "failed"
 
     generation_jobs[job_id] = job
+    log_timing(
+        "database_persistence_completed",
+        persistence_started_at,
+        job_id=job_id,
+        status=job["persistence_status"],
+    )
+
     # Support in-flight jobs created by the older callback-based app version.
     if request.callback_url and request.callback_token:
         send_generation_callback(job_id, request, job)
+
+    job_started_at = generation_started_at.pop(job_id, time.perf_counter())
+    log_timing(
+        "generation_job_completed",
+        job_started_at,
+        job_id=job_id,
+        status=job["status"],
+        persistence_status=job["persistence_status"],
+        file_count=len(request.files),
+    )
 
 
 def send_generation_callback(job_id: str, request: CanvasQuizRequest, job: dict):
@@ -369,6 +466,7 @@ def send_generation_callback(job_id: str, request: CanvasQuizRequest, job: dict)
         "error": job.get("error"),
     }
     for attempt in range(3):
+        attempt_started_at = time.perf_counter()
         try:
             response = requests.post(
                 request.callback_url,
@@ -377,26 +475,47 @@ def send_generation_callback(job_id: str, request: CanvasQuizRequest, job: dict)
                 timeout=30,
             )
             response.raise_for_status()
+            log_timing(
+                "callback_attempt_completed",
+                attempt_started_at,
+                job_id=job_id,
+                attempt=attempt + 1,
+            )
             return
         except Exception as error:
-            print(f"Assessment callback attempt {attempt + 1} failed: {error}")
+            log_timing(
+                "callback_attempt_failed",
+                attempt_started_at,
+                job_id=job_id,
+                attempt=attempt + 1,
+                error_type=type(error).__name__,
+            )
             if attempt < 2:
-                import time
                 time.sleep(2 ** attempt)
 
+
 def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
+    generation_started_at[job_id] = time.perf_counter()
     generation_jobs[job_id] = {"owner_id": owner_id, "status": "processing"}
     source_list = []
     combined_text = ""
+    log_event(
+        "generation_job_started",
+        job_id=job_id,
+        file_count=len(request.files),
+    )
 
     for source_id, file_item in enumerate(request.files, start=1):
         source_list.append({"source_id": source_id, "filename": file_item.filename})
+        file_started_at = time.perf_counter()
+        stage = "download"
 
         try:
             parsed_url = requests.utils.urlparse(file_item.url)
             if parsed_url.scheme not in {"http", "https"}:
                 raise ValueError("Only HTTP and HTTPS material links are supported")
             headers = {"Authorization": f"Bearer {request.canvas_token}"} if request.canvas_token else {}
+            download_started_at = time.perf_counter()
             response = requests.get(file_item.url, headers=headers, timeout=(10, 90), stream=True)
 
             if response.status_code != 200:
@@ -408,19 +527,68 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
                 file_bytes.extend(chunk)
                 if len(file_bytes) > max_bytes:
                     raise ValueError(f"{file_item.filename} is larger than the 25 MB limit")
-            extracted = extract_text_in_memory(bytes(file_bytes), file_item.filename, response.headers.get("content-type", ""))
+
+            log_timing(
+                "file_download_completed",
+                download_started_at,
+                job_id=job_id,
+                source_id=source_id,
+                filename=file_item.filename,
+                size_bytes=len(file_bytes),
+            )
+
+            stage = "extraction"
+            extraction_started_at = time.perf_counter()
+            extracted = extract_text_in_memory(
+                bytes(file_bytes),
+                file_item.filename,
+                response.headers.get("content-type", ""),
+            )
+            log_timing(
+                "file_extraction_completed",
+                extraction_started_at,
+                job_id=job_id,
+                source_id=source_id,
+                filename=file_item.filename,
+                extracted_characters=len(extracted),
+            )
             if not extracted.strip():
                 extension = file_item.filename.lower().split("?")[0].rsplit(".", 1)[-1]
-                if extension in {"pdf", "pptx", "docx", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"}:
+                if extension in {"pdf", "pptx", "docx", *IMAGE_EXTENSIONS}:
                     raise ValueError(
                         f"No readable text or image text could be extracted from {file_item.filename}. "
-                        "It may contain only unsupported graphics or linked images; embed the images or export the file to PDF and retry."
+                        "It may contain only unsupported graphics or linked images; embed the images "
+                        "or export the file to PDF and retry."
                     )
                 raise ValueError(f"No readable text found in {file_item.filename}")
-            combined_text += f"\n[BEGIN SOURCE {source_id}: {file_item.filename}]\n{extracted}\n[END SOURCE {source_id}]\n"
+            combined_text += (
+                f"\n[BEGIN SOURCE {source_id}: {file_item.filename}]\n"
+                f"{extracted}\n[END SOURCE {source_id}]\n"
+            )
+            log_timing(
+                "file_processing_completed",
+                file_started_at,
+                job_id=job_id,
+                source_id=source_id,
+                filename=file_item.filename,
+                extracted_characters=len(extracted),
+            )
 
         except Exception as e:
-            job = {"owner_id": owner_id, "status": "failed", "error": f"Failed processing {file_item.filename}: {str(e)}"}
+            log_timing(
+                "file_processing_failed",
+                file_started_at,
+                job_id=job_id,
+                source_id=source_id,
+                filename=file_item.filename,
+                stage=stage,
+                error_type=type(e).__name__,
+            )
+            job = {
+                "owner_id": owner_id,
+                "status": "failed",
+                "error": f"Failed processing {file_item.filename}: {str(e)}",
+            }
             generation_jobs[job_id] = job
             finalize_generation_job(job_id, request, job)
             return
@@ -432,7 +600,8 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
         return
 
     prompt = f"""
-    Generate a multiple-choice quiz with {request.num_questions} questions based exclusively on the provided sources.
+    Generate a multiple-choice quiz with {request.num_questions} questions based exclusively on the
+    provided sources.
 
     Strictly adhere to this JSON format:
     {{
@@ -456,6 +625,7 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
     {combined_text}
     """
 
+    ai_started_at = time.perf_counter()
     try:
         ai_response = client.models.generate_content(
             model=MODEL_NAME,
@@ -472,13 +642,31 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
         if not isinstance(quiz, list) or not quiz:
             raise ValueError("The AI returned no quiz questions")
         quiz = quiz[:request.num_questions]
-        job = {"owner_id": owner_id, "status": "completed", "result": {
-            "source_list": source_list,
-            "quiz": quiz
-        }}
+        log_timing(
+            "gemini_generation_completed",
+            ai_started_at,
+            job_id=job_id,
+            question_count=len(quiz),
+            source_count=len(source_list),
+        )
+        job = {
+            "owner_id": owner_id,
+            "status": "completed",
+            "result": {"source_list": source_list, "quiz": quiz},
+        }
         generation_jobs[job_id] = job
     except Exception as e:
-        job = {"owner_id": owner_id, "status": "failed", "error": f"AI generation failed: {str(e)}"}
+        log_timing(
+            "gemini_generation_failed",
+            ai_started_at,
+            job_id=job_id,
+            error_type=type(e).__name__,
+        )
+        job = {
+            "owner_id": owner_id,
+            "status": "failed",
+            "error": f"AI generation failed: {str(e)}",
+        }
         generation_jobs[job_id] = job
     finalize_generation_job(job_id, request, job)
 
@@ -491,7 +679,8 @@ async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest, backgroun
         raise HTTPException(status_code=400, detail="At least one material link is required")
     if not request.owner_id or not request.assessment_id:
         raise HTTPException(status_code=400, detail="Generation job metadata is required")
-    if not (os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")) or not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
+    database_url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+    if not database_url or not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
         raise HTTPException(status_code=503, detail="Worker database persistence is not configured")
     job_id = request.job_id or str(uuid.uuid4())
     generation_jobs[job_id] = {"owner_id": request.owner_id, "status": "queued"}
