@@ -9,17 +9,17 @@ from html.parser import HTMLParser
 from typing import List, Optional
 
 import fitz
-import pytesseract
 import requests
-from docx import Document
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from google import genai
+from google.genai import types
+from docx import Document
 from PIL import Image
 from pydantic import BaseModel
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from google import genai
-from google.genai import types
+from rapidocr import RapidOCR
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -50,6 +50,9 @@ if not api_key:
     raise ValueError("❌ Error: GEMINI_API_KEY environment variable not set.")
 
 client = genai.Client(api_key=api_key)
+rapidocr_initialization_started_at = time.perf_counter()
+rapidocr_engine = RapidOCR()
+log_timing("rapidocr_engine_initialized", rapidocr_initialization_started_at)
 MODEL_NAME = "gemini-2.5-flash"
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"}
 SYSTEM_INSTRUCTION = (
@@ -92,11 +95,13 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
     try:
         with Image.open(io.BytesIO(image_bytes)) as source_image:
             image_width, image_height = source_image.size
-            image = source_image.convert("RGB")
-        try:
-            extracted_text = pytesseract.image_to_string(image).strip()
-        finally:
-            image.close()
+        ocr_result = rapidocr_engine(image_bytes)
+        recognized_lines = getattr(ocr_result, "txts", None) or []
+        extracted_text = "\n".join(
+            str(line).strip()
+            for line in recognized_lines
+            if line is not None and str(line).strip()
+        )
     except Exception:
         log_timing(
             "image_ocr_failed",
@@ -113,6 +118,7 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
         image_bytes=len(image_bytes),
         image_width=image_width,
         image_height=image_height,
+        inference_seconds=getattr(ocr_result, "elapse", None),
         extracted_characters=len(extracted_text),
     )
     return extracted_text
