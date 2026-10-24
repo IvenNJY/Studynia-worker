@@ -9,5 +9,4 @@ python-pptx
 google-genai
 requests
 pydantic
-rapidocr
-onnxruntime
+
