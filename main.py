@@ -77,15 +77,23 @@ def extract_text_in_memory(file_bytes: bytes, filename: str, content_type: str =
                         image_number = add_image_ocr(shape.shapes, image_number)
                     elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                         image_number += 1
-                        image = Image.open(io.BytesIO(shape.image.blob)).convert("RGB")
-                        image_text = pytesseract.image_to_string(image).strip()
-                        if image_text:
-                            slide_parts.append(f"[Text detected in image {image_number}]\n{image_text}")
+                        try:
+                            image_bytes = shape.image.blob
+                            with Image.open(io.BytesIO(image_bytes)) as source_image:
+                                image = source_image.convert("RGB")
+                            image_text = pytesseract.image_to_string(image).strip()
+                            if image_text:
+                                slide_parts.append(f"[Text detected in image {image_number}]\n{image_text}")
+                        except Exception as image_error:
+                            # A linked picture can have no image bytes inside the PPTX.
+                            # Skip it so it doesn't prevent reading text or other images.
+                            print(f"Could not read image {image_number} on slide {i + 1}: {image_error}")
                 return image_number
 
             add_image_ocr(slide.shapes, 0)
             slide_text = "\n".join(slide_parts)
-            text += f"--- Slide {i+1} ---\n{slide_text}\n"
+            if slide_text:
+                text += f"--- Slide {i+1} ---\n{slide_text}\n"
     elif extension in {"txt", "md", "csv", "html", "htm"} or content_type.startswith("text/"):
         decoded = file_bytes.decode("utf-8-sig", errors="replace")
         if extension in {"html", "htm"} or "text/html" in content_type:
@@ -295,6 +303,11 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
                     raise ValueError(f"{file_item.filename} is larger than the 25 MB limit")
             extracted = extract_text_in_memory(bytes(file_bytes), file_item.filename, response.headers.get("content-type", ""))
             if not extracted.strip():
+                if file_item.filename.lower().split("?")[0].endswith(".pptx"):
+                    raise ValueError(
+                        f"No readable slide text or embedded image text found in {file_item.filename}. "
+                        "If the pictures are linked instead of embedded, reinsert them in PowerPoint or export the presentation to PDF."
+                    )
                 raise ValueError(f"No readable text found in {file_item.filename}")
             combined_text += f"\n[BEGIN SOURCE {source_id}: {file_item.filename}]\n{extracted}\n[END SOURCE {source_id}]\n"
 
