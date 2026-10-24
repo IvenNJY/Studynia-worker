@@ -3,6 +3,8 @@ uvicorn
 python-multipart
 pytesseract
 pdf2image
+PyMuPDF
+python-docx
 python-pptx
 google-genai
 requests
