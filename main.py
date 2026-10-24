@@ -3,6 +3,7 @@ import io
 import json
 import requests
 import uuid
+import zipfile
 from html.parser import HTMLParser
 from typing import List, Optional
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -10,7 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
 import pytesseract
-from pdf2image import convert_from_bytes
+import fitz
+from docx import Document
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from google import genai
@@ -54,48 +56,161 @@ class TextOnlyHTMLParser(HTMLParser):
         self.parts.append(data)
 
 
-def extract_text_in_memory(file_bytes: bytes, filename: str, content_type: str = "") -> str:
-    """Read supported course resources directly from memory."""
-    text = ""
-    extension = filename.lower().split("?")[0].rsplit(".", 1)[-1] if "." in filename else ""
-    content_type = content_type.lower()
-    if extension == "pdf" or "application/pdf" in content_type:
-        images = convert_from_bytes(file_bytes)
-        for i, img in enumerate(images):
-            page_text = pytesseract.image_to_string(img)
-            text += f"--- Page {i+1} ---\n{page_text}\n"
+def ocr_image_bytes(image_bytes: bytes) -> str:
+    """Extract readable text from one raster image."""
+    with Image.open(io.BytesIO(image_bytes)) as source_image:
+        image = source_image.convert("RGB")
+    try:
+        return pytesseract.image_to_string(image).strip()
+    finally:
+        image.close()
 
-    elif extension == "pptx" or "presentationml" in content_type:
-        prs = Presentation(io.BytesIO(file_bytes))
-        for i, slide in enumerate(prs.slides):
-            slide_parts = [shape.text.strip() for shape in slide.shapes
-                           if hasattr(shape, "text") and shape.text.strip()]
 
-            def add_image_ocr(shapes, image_number):
-                for shape in shapes:
-                    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-                        image_number = add_image_ocr(shape.shapes, image_number)
-                    elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                        image_number += 1
-                        image = Image.open(io.BytesIO(shape.image.blob)).convert("RGB")
-                        image_text = pytesseract.image_to_string(image).strip()
+def extract_pdf(file_bytes: bytes) -> str:
+    """Extract a PDF's text layer and OCR its embedded images."""
+    document = fitz.open(stream=file_bytes, filetype="pdf")
+    extracted_pages = []
+    for page_number, page in enumerate(document, start=1):
+        page_parts = []
+        native_text = page.get_text("text").strip()
+        if native_text:
+            page_parts.append(native_text)
+
+        image_text_found = False
+        for image_index, image_info in enumerate(page.get_images(full=True), start=1):
+            image_xref = image_info[0]
+            try:
+                image_data = document.extract_image(image_xref)
+                image_text = ocr_image_bytes(image_data["image"])
+                if image_text:
+                    image_text_found = True
+                    page_parts.append(f"[Text detected in image {image_index}]\n{image_text}")
+            except Exception as image_error:
+                print(f"Could not read PDF image {image_index} on page {page_number}: {image_error}")
+
+        # Scanned pages sometimes expose no separate images in the PDF structure.
+        # OCR the rendered page only when it has no extractable text or image text.
+        if not native_text and not image_text_found:
+            try:
+                rendered_page = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                page_ocr = ocr_image_bytes(rendered_page.tobytes("png"))
+                if page_ocr:
+                    page_parts.append(f"[Text detected by page OCR]\n{page_ocr}")
+            except Exception as render_error:
+                print(f"Could not OCR PDF page {page_number}: {render_error}")
+
+        if page_parts:
+            extracted_pages.append(f"--- Page {page_number} ---\n" + "\n".join(page_parts))
+
+    document.close()
+    return "\n".join(extracted_pages)
+
+
+def extract_pptx(file_bytes: bytes) -> str:
+    """Extract slide text, table text, and OCR from embedded pictures."""
+    presentation = Presentation(io.BytesIO(file_bytes))
+    extracted_slides = []
+
+    for slide_number, slide in enumerate(presentation.slides, start=1):
+        slide_parts = []
+
+        def extract_shapes(shapes, image_number=0):
+            for shape in shapes:
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    image_number = extract_shapes(shape.shapes, image_number)
+                    continue
+
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    image_number += 1
+                    try:
+                        image_text = ocr_image_bytes(shape.image.blob)
                         if image_text:
                             slide_parts.append(f"[Text detected in image {image_number}]\n{image_text}")
-                return image_number
+                    except Exception as image_error:
+                        # Linked pictures may not have image bytes embedded in the PPTX.
+                        print(f"Could not read image {image_number} on slide {slide_number}: {image_error}")
+                    continue
 
-            add_image_ocr(slide.shapes, 0)
-            slide_text = "\n".join(slide_parts)
-            text += f"--- Slide {i+1} ---\n{slide_text}\n"
-    elif extension in {"txt", "md", "csv", "html", "htm"} or content_type.startswith("text/"):
+                if hasattr(shape, "text"):
+                    shape_text = shape.text.strip()
+                    if shape_text:
+                        slide_parts.append(shape_text)
+
+                if getattr(shape, "has_table", False):
+                    for row in shape.table.rows:
+                        row_text = "\t".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                        if row_text:
+                            slide_parts.append(row_text)
+
+            return image_number
+
+        extract_shapes(slide.shapes)
+        if slide_parts:
+            extracted_slides.append(f"--- Slide {slide_number} ---\n" + "\n".join(slide_parts))
+
+    return "\n".join(extracted_slides)
+
+
+def extract_docx(file_bytes: bytes) -> str:
+    """Extract Word text and OCR images stored in a DOCX package."""
+    document = Document(io.BytesIO(file_bytes))
+    parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+
+    for table in document.tables:
+        for row in table.rows:
+            row_text = "\t".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if row_text:
+                parts.append(row_text)
+
+    image_number = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as package:
+            image_names = [name for name in package.namelist() if name.startswith("word/media/")]
+            for image_name in image_names:
+                image_number += 1
+                try:
+                    image_text = ocr_image_bytes(package.read(image_name))
+                    if image_text:
+                        parts.append(f"[Text detected in image {image_number}]\n{image_text}")
+                except Exception as image_error:
+                    print(f"Could not read DOCX image {image_name}: {image_error}")
+    except zipfile.BadZipFile as package_error:
+        raise ValueError("The DOCX package is invalid") from package_error
+
+    return "\n".join(parts)
+
+
+def extract_text_in_memory(file_bytes: bytes, filename: str, content_type: str = "") -> str:
+    """Read supported course resources, extracting native text and OCR where available."""
+    normalized_filename = filename.lower().split("?")[0]
+    extension = normalized_filename.rsplit(".", 1)[-1] if "." in normalized_filename else ""
+    content_type = content_type.lower()
+
+    if extension == "pdf" or "application/pdf" in content_type:
+        return extract_pdf(file_bytes)
+
+    if extension == "pptx" or "presentationml" in content_type:
+        return extract_pptx(file_bytes)
+
+    if extension == "docx" or "wordprocessingml" in content_type:
+        return extract_docx(file_bytes)
+
+    if extension in {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"} or content_type.startswith("image/"):
+        return ocr_image_bytes(file_bytes)
+
+    if extension in {"txt", "md", "csv", "html", "htm"} or content_type.startswith("text/"):
         decoded = file_bytes.decode("utf-8-sig", errors="replace")
         if extension in {"html", "htm"} or "text/html" in content_type:
             parser = TextOnlyHTMLParser()
             parser.feed(decoded)
-            text = "\n".join(part.strip() for part in parser.parts if part.strip())
-        else:
-            text = decoded
+            return "\n".join(part.strip() for part in parser.parts if part.strip())
+        return decoded
 
-    return text
+    # Some LMS downloads use a generic content type despite containing an image.
+    try:
+        return ocr_image_bytes(file_bytes)
+    except Exception:
+        return ""
 
 class FileItem(BaseModel):
     url: str
@@ -295,6 +410,12 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
                     raise ValueError(f"{file_item.filename} is larger than the 25 MB limit")
             extracted = extract_text_in_memory(bytes(file_bytes), file_item.filename, response.headers.get("content-type", ""))
             if not extracted.strip():
+                extension = file_item.filename.lower().split("?")[0].rsplit(".", 1)[-1]
+                if extension in {"pdf", "pptx", "docx", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"}:
+                    raise ValueError(
+                        f"No readable text or image text could be extracted from {file_item.filename}. "
+                        "It may contain only unsupported graphics or linked images; embed the images or export the file to PDF and retry."
+                    )
                 raise ValueError(f"No readable text found in {file_item.filename}")
             combined_text += f"\n[BEGIN SOURCE {source_id}: {file_item.filename}]\n{extracted}\n[END SOURCE {source_id}]\n"
 
