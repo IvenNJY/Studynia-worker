@@ -1,7 +1,10 @@
+import gc
 import io
 import json
 import logging
 import os
+import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -52,6 +55,8 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 MODEL_NAME = "gemini-2.5-flash"
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"}
+ALLOWED_FILE_EXTENSIONS = {"pdf", "docx", "pptx"}
+MAX_OCR_PIXELS = 25_000_000
 SYSTEM_INSTRUCTION = (
     "You are an academic quiz generator. You must base all questions and answers "
     "strictly on the provided source materials without inventing outside facts."
@@ -65,6 +70,7 @@ app = FastAPI(title="LMS Quiz Generator API")
 # cancel it.
 generation_jobs: dict[str, dict] = {}
 generation_started_at: dict[str, float] = {}
+generation_lock = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,6 +98,9 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
     try:
         with Image.open(io.BytesIO(image_bytes)) as source_image:
             image_width, image_height = source_image.size
+            if image_width * image_height > MAX_OCR_PIXELS:
+                raise ValueError("Image is too large for OCR")
+            source_image.thumbnail((3000, 3000))
             image = source_image.convert("RGB")
         try:
             extracted_text = pytesseract.image_to_string(image).strip()
@@ -118,9 +127,9 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
     return extracted_text
 
 
-def extract_pdf(file_bytes: bytes) -> str:
+def extract_pdf(file_path: str) -> str:
     """Extract a PDF's text layer and OCR its embedded images."""
-    document = fitz.open(stream=file_bytes, filetype="pdf")
+    document = fitz.open(file_path)
     extracted_pages = []
     for page_number, page in enumerate(document, start=1):
         page_parts = []
@@ -150,7 +159,10 @@ def extract_pdf(file_bytes: bytes) -> str:
         if not native_text and not image_text_found:
             try:
                 rendered_page = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                page_ocr = ocr_image_bytes(rendered_page.tobytes("png"))
+                try:
+                    page_ocr = ocr_image_bytes(rendered_page.tobytes("png"))
+                finally:
+                    del rendered_page
                 if page_ocr:
                     page_parts.append(f"[Text detected by page OCR]\n{page_ocr}")
             except Exception as render_error:
@@ -163,9 +175,9 @@ def extract_pdf(file_bytes: bytes) -> str:
     return "\n".join(extracted_pages)
 
 
-def extract_pptx(file_bytes: bytes) -> str:
+def extract_pptx(file_path: str) -> str:
     """Extract slide text, table text, and OCR from embedded pictures."""
-    presentation = Presentation(io.BytesIO(file_bytes))
+    presentation = Presentation(file_path)
     extracted_slides = []
 
     for slide_number, slide in enumerate(presentation.slides, start=1):
@@ -213,9 +225,9 @@ def extract_pptx(file_bytes: bytes) -> str:
     return "\n".join(extracted_slides)
 
 
-def extract_docx(file_bytes: bytes) -> str:
+def extract_docx(file_path: str) -> str:
     """Extract Word text and OCR images stored in a DOCX package."""
-    document = Document(io.BytesIO(file_bytes))
+    document = Document(file_path)
     parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
 
     for table in document.tables:
@@ -226,7 +238,7 @@ def extract_docx(file_bytes: bytes) -> str:
 
     image_number = 0
     try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as package:
+        with zipfile.ZipFile(file_path) as package:
             image_names = [name for name in package.namelist() if name.startswith("word/media/")]
             for image_name in image_names:
                 image_number += 1
@@ -242,37 +254,23 @@ def extract_docx(file_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
-def extract_text_in_memory(file_bytes: bytes, filename: str, content_type: str = "") -> str:
-    """Read supported course resources, extracting native text and OCR where available."""
+def extract_text_from_file(file_path: str, filename: str) -> str:
+    """Read a supported course resource from disk to avoid holding its full bytes in RAM."""
     normalized_filename = filename.lower().split("?")[0]
     extension = normalized_filename.rsplit(".", 1)[-1] if "." in normalized_filename else ""
-    content_type = content_type.lower()
+    if extension not in ALLOWED_FILE_EXTENSIONS:
+        raise ValueError("Only PDF, DOCX, and PPTX files are supported")
 
-    if extension == "pdf" or "application/pdf" in content_type:
-        return extract_pdf(file_bytes)
+    if extension == "pdf":
+        return extract_pdf(file_path)
 
-    if extension == "pptx" or "presentationml" in content_type:
-        return extract_pptx(file_bytes)
+    if extension == "pptx":
+        return extract_pptx(file_path)
 
-    if extension == "docx" or "wordprocessingml" in content_type:
-        return extract_docx(file_bytes)
+    if extension == "docx":
+        return extract_docx(file_path)
 
-    if extension in IMAGE_EXTENSIONS or content_type.startswith("image/"):
-        return ocr_image_bytes(file_bytes)
-
-    if extension in {"txt", "md", "csv", "html", "htm"} or content_type.startswith("text/"):
-        decoded = file_bytes.decode("utf-8-sig", errors="replace")
-        if extension in {"html", "htm"} or "text/html" in content_type:
-            parser = TextOnlyHTMLParser()
-            parser.feed(decoded)
-            return "\n".join(part.strip() for part in parser.parts if part.strip())
-        return decoded
-
-    # Some LMS downloads use a generic content type despite containing an image.
-    try:
-        return ocr_image_bytes(file_bytes)
-    except Exception:
-        return ""
+    raise ValueError("Only PDF, DOCX, and PPTX files are supported")
 
 class FileItem(BaseModel):
     url: str
@@ -494,11 +492,13 @@ def send_generation_callback(job_id: str, request: CanvasQuizRequest, job: dict)
                 time.sleep(2 ** attempt)
 
 
-def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
+def _generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
     generation_started_at[job_id] = time.perf_counter()
     generation_jobs[job_id] = {"owner_id": owner_id, "status": "processing"}
     source_list = []
-    combined_text = ""
+    combined_text_parts = []
+    combined_text_chars = 0
+    max_combined_text_chars = 500_000
     log_event(
         "generation_job_started",
         job_id=job_id,
@@ -509,6 +509,8 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
         source_list.append({"source_id": source_id, "filename": file_item.filename})
         file_started_at = time.perf_counter()
         stage = "download"
+        response = None
+        temp_file_path = None
 
         try:
             parsed_url = requests.utils.urlparse(file_item.url)
@@ -522,11 +524,17 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
                 raise ValueError(f"Could not retrieve {file_item.filename} (HTTP {response.status_code})")
 
             max_bytes = 25 * 1024 * 1024
-            file_bytes = bytearray()
-            for chunk in response.iter_content(64 * 1024):
-                file_bytes.extend(chunk)
-                if len(file_bytes) > max_bytes:
-                    raise ValueError(f"{file_item.filename} is larger than the 25 MB limit")
+            file_size = 0
+            suffix = os.path.splitext(file_item.filename.split("?")[0])[1].lower()
+            with tempfile.NamedTemporaryFile(prefix="studynia-", suffix=suffix, delete=False) as temp_file:
+                temp_file_path = temp_file.name
+                for chunk in response.iter_content(64 * 1024):
+                    if not chunk:
+                        continue
+                    file_size += len(chunk)
+                    if file_size > max_bytes:
+                        raise ValueError(f"{file_item.filename} is larger than the 25 MB limit")
+                    temp_file.write(chunk)
 
             log_timing(
                 "file_download_completed",
@@ -534,16 +542,13 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
                 job_id=job_id,
                 source_id=source_id,
                 filename=file_item.filename,
-                size_bytes=len(file_bytes),
+                size_bytes=file_size,
             )
 
             stage = "extraction"
             extraction_started_at = time.perf_counter()
-            extracted = extract_text_in_memory(
-                bytes(file_bytes),
-                file_item.filename,
-                response.headers.get("content-type", ""),
-            )
+            response.close()
+            extracted = extract_text_from_file(temp_file_path, file_item.filename)
             log_timing(
                 "file_extraction_completed",
                 extraction_started_at,
@@ -554,17 +559,20 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
             )
             if not extracted.strip():
                 extension = file_item.filename.lower().split("?")[0].rsplit(".", 1)[-1]
-                if extension in {"pdf", "pptx", "docx", *IMAGE_EXTENSIONS}:
+                if extension in ALLOWED_FILE_EXTENSIONS:
                     raise ValueError(
                         f"No readable text or image text could be extracted from {file_item.filename}. "
                         "It may contain only unsupported graphics or linked images; embed the images "
                         "or export the file to PDF and retry."
                     )
                 raise ValueError(f"No readable text found in {file_item.filename}")
-            combined_text += (
+            remaining_chars = max_combined_text_chars - combined_text_chars
+            bounded_extracted = extracted[:remaining_chars]
+            combined_text_parts.append(
                 f"\n[BEGIN SOURCE {source_id}: {file_item.filename}]\n"
-                f"{extracted}\n[END SOURCE {source_id}]\n"
+                f"{bounded_extracted}\n[END SOURCE {source_id}]\n"
             )
+            combined_text_chars += len(bounded_extracted)
             log_timing(
                 "file_processing_completed",
                 file_started_at,
@@ -573,6 +581,7 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
                 filename=file_item.filename,
                 extracted_characters=len(extracted),
             )
+            del extracted, bounded_extracted
 
         except Exception as e:
             log_timing(
@@ -592,7 +601,18 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
             generation_jobs[job_id] = job
             finalize_generation_job(job_id, request, job)
             return
+        finally:
+            if response is not None:
+                response.close()
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    logger.warning("Could not remove temporary file %s", temp_file_path)
+            gc.collect()
 
+    combined_text = "\n".join(combined_text_parts)
+    del combined_text_parts
     if not combined_text.strip():
         job = {"owner_id": owner_id, "status": "failed", "error": "No readable text extracted from files."}
         generation_jobs[job_id] = job
@@ -671,12 +691,24 @@ def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
     finalize_generation_job(job_id, request, job)
 
 
+def generate_quiz_job(job_id: str, owner_id: str, request: CanvasQuizRequest):
+    # OCR and document parsing can use hundreds of MB; serialize jobs on small worker instances.
+    with generation_lock:
+        _generate_quiz_job(job_id, owner_id, request)
+
+
 @app.post("/generate-quiz-from-urls")
 async def generate_quiz_from_urls_endpoint(request: CanvasQuizRequest, background_tasks: BackgroundTasks):
     # Enforce the limit at the worker boundary as clients can bypass the web app API.
     request.num_questions = min(15, max(1, request.num_questions))
     if not request.files:
         raise HTTPException(status_code=400, detail="At least one material link is required")
+    unsupported_files = [
+        file.filename for file in request.files
+        if file.filename.lower().split("?")[0].rsplit(".", 1)[-1] not in ALLOWED_FILE_EXTENSIONS
+    ]
+    if unsupported_files:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX, and PPTX files are supported")
     if not request.owner_id or not request.assessment_id:
         raise HTTPException(status_code=400, detail="Generation job metadata is required")
     database_url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
