@@ -1,0 +1,4 @@
+model,status,latency_seconds,prompt_tokens,output_tokens,json_valid,quality_score,question_count,error
+gemini-2.5-flash,success,9.615,805,721,True,100.0,5,
+gemini-3.5-flash,success,11.78,805,679,True,100.0,5,
+gemini-3.5-flash-lite,success,1.882,805,607,True,100.0,5,

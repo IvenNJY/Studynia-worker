@@ -1,0 +1,212 @@
+[
+  {
+    "model": "gemini-2.5-flash",
+    "status": "success",
+    "latency_seconds": 9.615,
+    "prompt_tokens": 805,
+    "output_tokens": 721,
+    "json_valid": true,
+    "quality_score": 100.0,
+    "question_count": 5,
+    "generated_quiz": {
+      "quiz": [
+        {
+          "question": "According to the source, what is the definition of Machine Learning?",
+          "options": {
+            "A": "The process of explicitly programming machines to perform specific tasks.",
+            "B": "The science of getting Machines to learn without being explicitly programmed.",
+            "C": "A method for building recommender systems using collaborative filtering.",
+            "D": "The application of neural networks to multi-class classification problems."
+          },
+          "correct_answer": "B",
+          "explanation": "The 'MACHINE LEARNING INTRODUCTION' section defines Machine Learning as the 'Science of getting Machines to learn without being explicitly programmed'."
+        },
+        {
+          "question": "Which of the following is a characteristic of Supervised Learning, according to the provided text?",
+          "options": {
+            "A": "It is used to find structure or patterns in data that isn't associated with any output labels.",
+            "B": "It involves building models that generalize to data and tasks in the real world without prior training.",
+            "C": "It learns by seeing correct pairs of input (x) and desired output label (y).",
+            "D": "It primarily focuses on building deep reinforcement learning models."
+          },
+          "correct_answer": "C",
+          "explanation": "The 'Supervised learning' section states that the learning algorithm learns 'by seeing correct pairs of input x and desired output label y'."
+        },
+        {
+          "question": "What are the two major types of Supervised Learning mentioned in the source material?",
+          "options": {
+            "A": "Clustering and Anomaly Detection",
+            "B": "Recommender Systems and Reinforcement Learning",
+            "C": "Classification and Regression",
+            "D": "Neural Networks and Decision Trees"
+          },
+          "correct_answer": "C",
+          "explanation": "Under the 'Supervised Learning' heading, the text explicitly lists '2 major types of Supervised Learning: Classification, Regression'."
+        },
+        {
+          "question": "Which of the following is identified as a type of unsupervised learning algorithm that takes data without labels and tries to automatically group them into clusters?",
+          "options": {
+            "A": "Linear Regression",
+            "B": "Logistic Regression",
+            "C": "Clustering",
+            "D": "Boosted Trees"
+          },
+          "correct_answer": "C",
+          "explanation": "The 'Unsupervised Learning' section describes 'Clustering' as 'a type of unsupervised learning algorithm, takes data without labels and tries to automatically group them into clusters'."
+        },
+        {
+          "question": "In the context of Linear Regression terminology, what does 'y' represent?",
+          "options": {
+            "A": "The input feature",
+            "B": "The number of training examples",
+            "C": "The output variable or target variable",
+            "D": "A single training example"
+          },
+          "correct_answer": "C",
+          "explanation": "Under 'Linear Regression - Terminology', 'y' is defined as the 'output variable/ target variable \u2013 what u are trying to predict'."
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "model": "gemini-3.5-flash",
+    "status": "success",
+    "latency_seconds": 11.78,
+    "prompt_tokens": 805,
+    "output_tokens": 679,
+    "json_valid": true,
+    "quality_score": 100.0,
+    "question_count": 5,
+    "generated_quiz": {
+      "quiz": [
+        {
+          "question": "According to the provided text, what is Machine Learning defined as?",
+          "options": {
+            "A": "The art of writing explicit rules for complex output labels",
+            "B": "The science of getting machines to learn without being explicitly programmed",
+            "C": "A method of manually grouping data into non-numeric categories",
+            "D": "The process of evaluating algorithms solely using cost functions"
+          },
+          "correct_answer": "B",
+          "explanation": "The text explicitly defines Machine Learning as the 'Science of getting Machines to learn without being explicitly programmed'."
+        },
+        {
+          "question": "In the linear regression terminology provided, what does 'm' represent?",
+          "options": {
+            "A": "The mean squared error function",
+            "B": "The target variable to be predicted",
+            "C": "The number of training examples",
+            "D": "The weight parameter adjusted during training"
+          },
+          "correct_answer": "C",
+          "explanation": "According to the source terminology, 'm' stands for the 'number of training examples'."
+        },
+        {
+          "question": "Which of the following is listed under 'Besides User Applications' of Machine Learning?",
+          "options": {
+            "A": "Tag friends in Insta",
+            "B": "Play Eminem song for me Siri",
+            "C": "Assembly Line Defect Detection",
+            "D": "I love MI7 \u2013 what else to watch"
+          },
+          "correct_answer": "C",
+          "explanation": "The source lists 'Assembly Line Defect Detection' alongside 'Climate change modelling' and 'Diagnosis' under the section 'Besides User Applications'."
+        },
+        {
+          "question": "What defines the data given to an Unsupervised Learning algorithm like clustering?",
+          "options": {
+            "A": "It contains predefined output labels y for every input",
+            "B": "It isn't associated with any output labels y",
+            "C": "It only consists of binary outputs such as 0 or 1",
+            "D": "It requires explicit target variables for prediction"
+          },
+          "correct_answer": "B",
+          "explanation": "The text states that in Unsupervised Learning, 'Were given data that isn\u2019t associated with any output labels y'."
+        },
+        {
+          "question": "In the course '6006CEM- Advanced Learning Algorithms', which technology is specified for building and training a neural network?",
+          "options": {
+            "A": "TensorFlow",
+            "B": "NumPy",
+            "C": "scikit-learn",
+            "D": "Collaborative Filtering"
+          },
+          "correct_answer": "A",
+          "explanation": "Under '6006CEM- Advanced Learning Algorithms', the source states: 'Build and train a neural network with TensorFlow to perform multi-class classification'."
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "model": "gemini-3.5-flash-lite",
+    "status": "success",
+    "latency_seconds": 1.882,
+    "prompt_tokens": 805,
+    "output_tokens": 607,
+    "json_valid": true,
+    "quality_score": 100.0,
+    "question_count": 5,
+    "generated_quiz": {
+      "quiz": [
+        {
+          "question": "Which libraries are used to build machine learning models in Python according to the Supervised Machine Learning module?",
+          "options": {
+            "A": "TensorFlow and Keras",
+            "B": "NumPy & scikit-learn",
+            "C": "Pandas and PyTorch",
+            "D": "SciPy and Matplotlib"
+          },
+          "correct_answer": "B",
+          "explanation": "The source states to build machine learning models in Python using popular machine learning libraries NumPy & scikit-learn."
+        },
+        {
+          "question": "What is the science of getting machines to learn without being explicitly programmed called?",
+          "options": {
+            "A": "Deep Learning",
+            "B": "Machine Learning",
+            "C": "Artificial Intelligence",
+            "D": "Supervised Learning"
+          },
+          "correct_answer": "B",
+          "explanation": "The source defines Machine Learning as the science of getting machines to learn without being explicitly programmed."
+        },
+        {
+          "question": "In the context of supervised learning, what does 'y' represent?",
+          "options": {
+            "A": "Input feature",
+            "B": "Number of training examples",
+            "C": "Output variable or target variable",
+            "D": "Weight parameter"
+          },
+          "correct_answer": "C",
+          "explanation": "The source defines y as the output variable / target variable \u2013 what you are trying to predict (or the correct label)."
+        },
+        {
+          "question": "Why is breast cancer detection considered a classification task?",
+          "options": {
+            "A": "It predicts continuous numeric values.",
+            "B": "It uses unsupervised clustering.",
+            "C": "It has only 2 possible outputs (benign or malignant).",
+            "D": "It relies on reinforcement learning."
+          },
+          "correct_answer": "C",
+          "explanation": "The source explains that breast cancer detection is classification because there are only 2 possible outputs (benign 0 / malignant 1)."
+        },
+        {
+          "question": "What parameters do you adjust during the training of linear regression with 1 variable?",
+          "options": {
+            "A": "x and y",
+            "B": "m and i",
+            "C": "w and b",
+            "D": "MSE and CNN"
+          },
+          "correct_answer": "C",
+          "explanation": "The source notes that w and b are parameters you adjust during training, also known as coefficients or weight."
+        }
+      ]
+    },
+    "error": ""
+  }
+]
